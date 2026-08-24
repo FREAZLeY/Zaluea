@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -45,20 +45,62 @@ jobs:
           unzip -q geolab-project.zip -d project
 
       - name: Test and build
+        id: gradle_build
         working-directory: project
+        shell: bash
         run: |
-          gradle --no-daemon testDebugUnitTest lintDebug assembleDebug
+          set +e
+          gradle --no-daemon testDebugUnitTest lintDebug assembleDebug 2>&1 | tee ../gradle-build.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Stage APK
+      - name: Stage results
+        shell: bash
         run: |
           mkdir output
-          cp project/app/build/outputs/apk/debug/app-debug.apk output/GeoLab-1.0.0-debug.apk
-          sha256sum output/GeoLab-1.0.0-debug.apk > output/GeoLab-1.0.0-debug.apk.sha256
+          cp gradle-build.log output/gradle-build.log
+          printf '%s\n' "${{ github.sha }}" > output/source-commit.txt
+          if [ -f project/app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp project/app/build/outputs/apk/debug/app-debug.apk output/GeoLab-1.0.0-debug.apk
+            sha256sum output/GeoLab-1.0.0-debug.apk > output/GeoLab-1.0.0-debug.apk.sha256
+            printf '%s\n' success > output/BUILD_STATUS.txt
+          else
+            printf '%s\n' failure > output/BUILD_STATUS.txt
+          fi
 
-      - name: Upload APK
+      - name: Publish build result branch
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir publish
+          cp output/BUILD_STATUS.txt output/gradle-build.log output/source-commit.txt publish/
+          if [ -f output/GeoLab-1.0.0-debug.apk ]; then
+            cp output/GeoLab-1.0.0-debug.apk.sha256 publish/
+            base64 -w 0 output/GeoLab-1.0.0-debug.apk > publish/GeoLab-1.0.0-debug.apk.b64
+            split -b 8000 -d -a 3 publish/GeoLab-1.0.0-debug.apk.b64 publish/GeoLab-1.0.0-debug.apk.b64.part
+            rm publish/GeoLab-1.0.0-debug.apk.b64
+          fi
+          cd publish
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b geolab-apk-output
+          git add .
+          git commit -m "GeoLab APK build result for $GITHUB_SHA"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin geolab-apk-output
+
+      - name: Upload APK artifact
+        if: steps.gradle_build.outputs.status == '0'
         uses: actions/upload-artifact@v4
         with:
           name: GeoLab-Android-APK
-          path: output/
+          path: output/GeoLab-1.0.0-debug.apk*
           if-no-files-found: error
           retention-days: 3
+
+      - name: Fail workflow when Gradle failed
+        if: steps.gradle_build.outputs.status != '0'
+        run: exit 1
